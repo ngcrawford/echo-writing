@@ -57,6 +57,14 @@ private struct MenuContent: View {
             NSApp.activate()
         }
         .keyboardShortcut("k")
+        if case .active(let app, _, _) = model.live.status {
+            Button("Check This \(app) Document") {
+                model.pendingCheckText = model.live.currentDocumentText()
+                openWindow(id: WindowID.checkText)
+                NSApp.activate()
+            }
+            .keyboardShortcut("k", modifiers: [.command, .shift])
+        }
         Button("Settings…") {
             openWindow(id: WindowID.settings)
             NSApp.activate()

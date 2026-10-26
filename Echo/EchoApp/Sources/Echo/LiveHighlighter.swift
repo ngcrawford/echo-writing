@@ -12,7 +12,7 @@ import Observation
 @MainActor @Observable
 final class LiveHighlighter {
     /// A match in the current text. Ranges shift on every edit so highlights stay put until the next analysis.
-    private struct Tracked {
+    private struct Tracked: Sendable {
         var range: NSRange
         let isRepeat: Bool
         let strength: CGFloat
@@ -21,8 +21,8 @@ final class LiveHighlighter {
         /// what "Exclude" and "Ignore in document" add, so every form of the word is covered.
         let word: String
         let forms: [String]
-        /// The rest of the repeat group, for "Show other".
-        var others: [NSRange]
+        /// Which repeat group it belongs to, so "Show other" can find the rest.
+        let group: Int?
     }
 
     enum Status: Equatable {
@@ -68,6 +68,11 @@ final class LiveHighlighter {
         didSet { UserDefaults.standard.set(documentIgnores, forKey: "documentIgnores") }
     }
 
+    /// The full text of the document being highlighted, for "Check Text" (SPEC §5.6).
+    func currentDocumentText() -> String? {
+        editor?.string(kAXValueAttribute)
+    }
+
     func clearDocumentIgnores() {
         documentIgnores = [:]
         scheduleAnalysis(after: .zero)
@@ -99,8 +104,12 @@ final class LiveHighlighter {
     @ObservationIgnored private let overlay = OverlayWindow()
     @ObservationIgnored private let bubble = HoverBubble()
     @ObservationIgnored private var geometryScheduled = false
+    @ObservationIgnored private var lastGeometry = ContinuousClock.now
     @ObservationIgnored private var lastLayout: (position: CGPoint, clip: CGRect)?
     @ObservationIgnored private var pollTimer: Timer?
+    /// Polls run every 0.1 s while the user is active, every 0.5 s after 2 s of quiet (idle CPU ~0).
+    @ObservationIgnored private var lastActivity = ContinuousClock.now
+    @ObservationIgnored private var pollTick = 0
     @ObservationIgnored private var permissionTimer: Timer?
     @ObservationIgnored private var eventMonitor: Any?
     @ObservationIgnored private var hoverTask: Task<Void, Never>?
@@ -123,6 +132,9 @@ final class LiveHighlighter {
             return
         }
         status = .idle
+        // A busy host app (laying out a long manuscript, say) shouldn't freeze Echo for the default 6 s per query.
+        // Set on the system-wide element, this applies to every element Echo talks to.
+        AXUIElementSetMessagingTimeout(AXUIElementCreateSystemWide(), 0.2)
         activationObserver = NSWorkspace.shared.notificationCenter.addObserver(
             forName: NSWorkspace.didActivateApplicationNotification, object: nil, queue: .main
         ) { [weak self] note in
@@ -173,8 +185,6 @@ final class LiveHighlighter {
         bundleID = id
         pid = app.processIdentifier
         let element = AXUIElementCreateApplication(pid)
-        // A busy host app shouldn't freeze Echo's main thread for the default 6 s.
-        AXUIElementSetMessagingTimeout(element, 0.5)
         appElement = element
 
         var observer: AXObserver?
@@ -202,6 +212,7 @@ final class LiveHighlighter {
     private var refcon: UnsafeMutableRawPointer { Unmanaged.passUnretained(self).toOpaque() }
 
     fileprivate func handle(_ notification: String, element: AXUIElement) {
+        lastActivity = .now
         switch notification {
         case kAXValueChangedNotification where element.isSame(as: editor):
             textChanged()
@@ -220,8 +231,9 @@ final class LiveHighlighter {
         guard let appElement else { return }
         let window = appElement.element(kAXFocusedWindowAttribute)
         var found: AXUIElement?
-        if let focused = appElement.element(kAXFocusedUIElementAttribute), Accessibility.isEditor(focused) {
-            found = focused
+        if let focused = appElement.element(kAXFocusedUIElementAttribute), Accessibility.isEditor(focused),
+           focused.element(kAXWindowAttribute).map({ $0.isSame(as: window) }) == true {
+            found = focused   // (focus can briefly still report the previous window's editor after a window switch)
         } else if let editor, editor.frame != nil, editor.element(kAXWindowAttribute).map({ $0.isSame(as: window) }) == true {
             found = editor   // Focus moved to the binder or inspector: keep highlighting the same editor.
         } else if let window {
@@ -309,7 +321,6 @@ final class LiveHighlighter {
             guard let range = shift(item.range) else { return nil }
             var item = item
             item.range = range
-            item.others = item.others.compactMap(shift)
             return item
         }
         ignoredHere = ignoredHere.compactMap(shift)
@@ -331,47 +342,55 @@ final class LiveHighlighter {
         let startGeneration = generation
         var settings = settings
         settings.ignoreList += documentIgnores[documentKey] ?? []
-        let result = await Task.detached(priority: .userInitiated) {
-            analyzer.analyze(text, settings: settings)
+        let ignored = Set(ignoredHere.map(\.location))
+        // Everything up to the finished highlight list runs off the main thread: ~200 ms for a 130k-word manuscript.
+        let (result, items) = await Task.detached(priority: .userInitiated) {
+            let result = analyzer.analyze(text, settings: settings)
+            return (result, Self.trackedMatches(result, text: text, ignored: ignored))
         }.value
         guard !Task.isCancelled, startGeneration == generation, editor.isSame(as: self.editor) else { return }
 
         textLength = (text as NSString).length
-        let ns = text as NSString
-        let ignored = Set(ignoredHere.map(\.location))
-        tracked = zip(result.matches, Highlights.explanations(for: result, text: text)).compactMap { match, tip in
-            guard !ignored.contains(match.range.location) else { return nil }
-            let word = ns.substring(with: match.range).lowercased()
-            var others: [NSRange] = []
-            var forms = [word]
-            var isRepeat = false
-            if case .repeated(let g, _) = match.kind {
-                isRepeat = true
-                others = result.repeatGroups[g].ranges.filter { $0 != match.range }
-                if result.repeatGroups[g].word != word { forms.append(result.repeatGroups[g].word) }
-            }
-            return Tracked(range: match.range, isRepeat: isRepeat, strength: Highlights.strength(for: match, in: result),
-                           tip: tip, word: word, forms: forms, others: others)
-        }
+        tracked = items
         status = .active(app: appName, repeats: result.repeatGroups.count, watch: result.watchHits.count)
         scheduleGeometry()
     }
 
+    nonisolated private static func trackedMatches(_ result: AnalysisResult, text: String, ignored: Set<Int>) -> [Tracked] {
+        let ns = text as NSString
+        return zip(result.matches, Highlights.explanations(for: result, text: text)).compactMap { match, tip in
+            guard !ignored.contains(match.range.location) else { return nil }
+            let word = ns.substring(with: match.range).lowercased()
+            var forms = [word]
+            var group: Int?
+            if case .repeated(let g, _) = match.kind {
+                group = g
+                if result.repeatGroups[g].word != word { forms.append(result.repeatGroups[g].word) }
+            }
+            return Tracked(range: match.range, isRepeat: group != nil, strength: Highlights.strength(for: match, in: result),
+                           tip: tip, word: word, forms: forms, group: group)
+        }
+    }
+
     // MARK: Geometry
 
-    /// Coalesces redraw requests into one per run-loop pass.
-    private func scheduleGeometry() {
+    /// Coalesces redraw requests, at most ~30 a second. Every redraw makes the host app answer Accessibility
+    /// queries on its own main thread, so redrawing on every scroll event would slow its scrolling.
+    private func scheduleGeometry(after minimum: Duration = .zero) {
         guard !geometryScheduled else { return }
         geometryScheduled = true
-        DispatchQueue.main.async { [weak self] in
-            MainActor.assumeIsolated {
-                self?.geometryScheduled = false
-                self?.updateGeometry()
-            }
+        let wait = max(minimum, .milliseconds(33) - (ContinuousClock.now - lastGeometry))
+        Task { [weak self] in
+            if wait > .zero { try? await Task.sleep(for: wait) }
+            guard let self else { return }
+            self.geometryScheduled = false
+            self.lastGeometry = .now
+            self.updateGeometry()
         }
     }
 
     private func updateGeometry() {
+        let deadline = ContinuousClock.now + .milliseconds(150)
         guard let editor, let layout = currentLayout(), shouldShow() else {
             overlay.hide()
             bubble.hide()
@@ -380,16 +399,25 @@ final class LiveHighlighter {
         lastLayout = layout
         let visible = editor.range(kAXVisibleCharacterRangeAttribute) ?? NSRange(location: 0, length: textLength)
         var marks: [OverlayMark] = []
-        // Whether each line is really showing, keyed by its y. Headers and toolbars can float over the top of
-        // the scroll area (Vellum's chapter header does), hiding lines that are inside the clip.
+        // Whether each line is really showing, keyed by its y. Headers and toolbars can float over the edges of
+        // the scroll area (Vellum's chapter header does), hiding lines that are inside the clip; only lines near
+        // the edges are checked.
         var lineShowing: [Int: Bool] = [:]
+        let edgeBand: CGFloat = 150
         for (id, item) in tracked.enumerated() where NSIntersectionRange(item.range, visible).length > 0 || visible.length == 0 {
-            guard let rect = editor.bounds(for: item.range), rect.width > 0, rect.intersects(layout.clip) else { continue }
-            let line = Int(rect.midY.rounded())
-            if lineShowing[line] == nil {
-                lineShowing[line] = isEditorShowing(at: CGPoint(x: rect.midX, y: rect.midY), editor: editor)
+            if ContinuousClock.now > deadline {
+                // The app is slow to answer (busy laying out a long document): keep what's drawn and try again.
+                scheduleGeometry(after: .milliseconds(250))
+                return
             }
-            guard lineShowing[line] == true else { continue }
+            guard let rect = editor.bounds(for: item.range), rect.width > 0, rect.intersects(layout.clip) else { continue }
+            if rect.midY < layout.clip.minY + edgeBand || rect.midY > layout.clip.maxY - edgeBand {
+                let line = Int(rect.midY.rounded())
+                if lineShowing[line] == nil {
+                    lineShowing[line] = isEditorShowing(at: CGPoint(x: rect.midX, y: rect.midY), editor: editor)
+                }
+                guard lineShowing[line] == true else { continue }
+            }
             marks.append(OverlayMark(id: id, rect: rect, color: item.isRepeat ? Highlights.repeatColor : Highlights.watchColor,
                                      wavy: item.isRepeat, strength: item.strength))
         }
@@ -424,8 +452,15 @@ final class LiveHighlighter {
 
     /// Catches scrolling, resizing and lost editors that the host app doesn't announce.
     private func poll() {
-        guard appElement != nil else { return }
+        guard let appElement else { return }
+        pollTick += 1
+        if ContinuousClock.now - lastActivity > .seconds(2), !pollTick.isMultiple(of: 5) { return }
         guard let editor else {
+            locateEditor()
+            return
+        }
+        // Another window of the same app came to the front without telling us.
+        if let window = appElement.element(kAXFocusedWindowAttribute), !window.isSame(as: editorWindow) {
             locateEditor()
             return
         }
@@ -443,6 +478,7 @@ final class LiveHighlighter {
     // MARK: Hover
 
     private func handleMouse(_ type: NSEvent.EventType) {
+        lastActivity = .now
         let point = NSEvent.mouseLocation.flippedToAX
         switch type {
         case .scrollWheel:
@@ -474,7 +510,7 @@ final class LiveHighlighter {
     private func actions(for id: Int) -> [HoverAction] {
         let item = tracked[id]
         var actions: [HoverAction] = []
-        if item.isRepeat, !item.others.isEmpty {
+        if item.group != nil {
             actions.append(HoverAction(title: "Show other", help: "Flash the nearest other use of this word") { [weak self] in
                 self?.showOther(of: item)
             })
@@ -497,7 +533,8 @@ final class LiveHighlighter {
 
     /// Flashes the nearest other occurrence; if it's off screen, selects it so the app scrolls to it.
     private func showOther(of item: Tracked) {
-        guard let editor, let target = item.others.min(by: {
+        let others = tracked.filter { $0.group == item.group && $0.range != item.range }.map(\.range)
+        guard let editor, let target = others.min(by: {
             abs($0.location - item.range.location) < abs($1.location - item.range.location)
         }) else { return }
         if let rect = editor.bounds(for: target), let clip = lastLayout?.clip, clip.contains(CGPoint(x: rect.midX, y: rect.midY)) {

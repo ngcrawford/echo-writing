@@ -140,6 +140,17 @@ final class CheckTextDocument: NSObject, NSTextViewDelegate {
         storage.endEditing()
     }
 
+    /// The form a word most often takes in the text ("George", "walked"), for showing in place of its root
+    /// ("georg", "walk").
+    func writtenForm(at ranges: [NSRange], fallback: String) -> String {
+        let text = textView.string as NSString
+        var counts: [String: Int] = [:]
+        for range in ranges where NSMaxRange(range) <= text.length {
+            counts[text.substring(with: range), default: 0] += 1
+        }
+        return counts.max { $0.value < $1.value || ($0.value == $1.value && $0.key > $1.key) }?.key ?? fallback
+    }
+
     // MARK: Navigation
 
     /// Selects and flashes the next of `ranges` each time it's called with the same `key`.

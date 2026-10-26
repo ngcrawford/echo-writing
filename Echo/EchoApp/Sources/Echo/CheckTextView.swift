@@ -59,11 +59,21 @@ struct CheckTextView: View {
             document.settings = model.settings
             document.highlightStyle = model.highlightStyle
             document.analyzer = model.analyzer
+            loadPendingText()
         }
         .onDisappear { model.windowClosed() }
         .onChange(of: model.analyzer == nil) { document.analyzer = model.analyzer }
         .onChange(of: model.settings) { document.settings = model.settings }
         .onChange(of: model.highlightStyle) { document.highlightStyle = model.highlightStyle }
+        .onChange(of: model.pendingCheckText) { loadPendingText() }
+    }
+
+    /// Loads a document sent from the writing app by "Check This Document".
+    private func loadPendingText() {
+        guard let text = model.pendingCheckText else { return }
+        model.pendingCheckText = nil
+        document.replaceText(with: text)
+        sidebarTab = .report
     }
 
     private var placeholder: some View {

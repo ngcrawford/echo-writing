@@ -60,6 +60,9 @@ final class AppModel {
         }
     }
 
+    /// Text for the Check Text window to load when it next appears (from "Check This Document").
+    var pendingCheckText: String?
+
     /// Set by "Pause for 1 Hour"; highlighting resumes by itself afterwards.
     private(set) var pausedUntil: Date?
     @ObservationIgnored private var resumeTask: Task<Void, Never>?

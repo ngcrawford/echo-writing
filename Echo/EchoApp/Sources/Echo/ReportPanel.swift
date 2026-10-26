@@ -35,7 +35,7 @@ struct ReportPanel: View {
         Section("Most used words") {
             ForEach(report.topWords, id: \.word) { w in
                 row(key: "word:\(w.word)", ranges: w.ranges) {
-                    Text(w.word)
+                    Text(document.writtenForm(at: w.ranges, fallback: w.word))
                     Text(w.tier.label).font(.caption).foregroundStyle(.secondary)
                     Spacer()
                     if w.repeatGroups > 0 {
