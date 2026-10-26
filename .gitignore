@@ -5,8 +5,8 @@ build/
 .swiftpm/
 DerivedData/
 
-# Spike probe binary and its screenshots (they show manuscript pages)
+# Spike probe binary and its reports (they quote manuscript pages)
 spike/AXProbe/axprobe
-spike/results/*.png
+spike/results/
 
 .DS_Store
