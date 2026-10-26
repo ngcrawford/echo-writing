@@ -1,0 +1,12 @@
+# SwiftPM and app builds
+.build/
+build/
+*.xcodeproj/
+.swiftpm/
+DerivedData/
+
+# Spike probe binary and its screenshots (they show manuscript pages)
+spike/AXProbe/axprobe
+spike/results/*.png
+
+.DS_Store
